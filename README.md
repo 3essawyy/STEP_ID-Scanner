@@ -26,6 +26,31 @@ Key goals:
 - 🧪 Interactive result inspection (row-by-row image + extracted data)
 
 ---
+## 🖥️ User Interface (Streamlit Dashboard)
+
+The project includes a **Streamlit-based interactive web UI** that allows running the OCR pipeline without using the command line.
+
+### 🔹 Single ID Processing
+- Upload a single ID image
+- Displays:
+  - Original image
+  - Aligned image
+  - Cropped regions (Name, Code, Payment ID)
+  - Individual digit segments
+- Shows extracted:
+  - Arabic name
+  - Student code
+  - Payment ID
+
+### 🔹 Batch Folder Processing
+- Processes all images inside the `Raw_IDs/` directory
+- Live processing feed with:
+  - Original vs aligned images
+  - Extracted fields per ID
+- Automatically exports results to **Excel**
+- Optional accuracy report using a provided `True Results.xlsx`
+   
+---
 
 ## 🛠️ Tech Stack
 
