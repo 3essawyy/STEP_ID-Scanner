@@ -56,7 +56,12 @@ def is_impulsive_noise(img, threshold=0.1, black_range=(0, 9), white_range=(246,
 def is_random_noise(img, threshold=0.1):
     if len(img.shape) == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
+        
+    stddev = np.std(img)
+    normalized_stddev = stddev / 255.0
+
+    if normalized_stddev < threshold:
+        return img, False
     treated_img = cv2.fastNlMeansDenoising(
         img, 
         None, 
