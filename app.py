@@ -17,11 +17,14 @@ RAW_IDS_FOLDER = backend.PATH_TO_RAW_IDS
 @st.cache_resource
 def load_resources():
     try:
-        # FIX: Use correct function name and no arguments (backend handles path)
+        # Load Model
         svm = backend.train_SVM_robust()
         
-        # Initialize EasyOCR
-        reader = backend.easyocr.Reader(['ar', 'en'], gpu=False)
+        # --- FORCE GPU HERE ---
+        # If your notebook used GPU, this MUST be True.
+        print("Initializing EasyOCR with gpu=True...")
+        reader = backend.easyocr.Reader(['ar', 'en'], gpu=True) 
+        
         return svm, reader
     except Exception as e:
         st.error(f"Resource Error: {e}")
