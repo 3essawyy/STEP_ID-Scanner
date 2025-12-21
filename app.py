@@ -7,22 +7,30 @@ import backend
 import tempfile
 
 st.set_page_config(page_title="ID Scanner", layout="wide")
-REFERENCE_PATH = os.path.join("Raw_IDs", "ID14.jpg")
+
+# --- USE ROBUST PATHS FROM BACKEND ---
+# We use the paths we calculated in backend.py so they never break
+REFERENCE_PATH = backend.REF_IMG_PATH
+RAW_IDS_FOLDER = backend.PATH_TO_RAW_IDS
 
 # --- LOAD RESOURCES ---
 @st.cache_resource
 def load_resources():
     try:
-        svm = backend.load_and_train_model("train_digits")
+        # FIX: Use correct function name and no arguments (backend handles path)
+        svm = backend.train_SVM_robust()
+        
+        # Initialize EasyOCR
         reader = backend.easyocr.Reader(['ar', 'en'], gpu=False)
         return svm, reader
     except Exception as e:
+        st.error(f"Resource Error: {e}")
         return None, None
 
 svm_model, ocr_reader = load_resources()
 
 if not svm_model:
-    st.error("Model loading failed. Ensure 'train_digits' exists.")
+    st.error("Model loading failed. Ensure 'train_digits' folder is correctly placed.")
     st.stop()
 
 # --- SIDEBAR ---
@@ -57,7 +65,6 @@ if mode == "Single Upload":
             st.divider()
             st.subheader("Extraction Details")
             
-            # --- UPDATED DEBUG VIEW ---
             d1, d2, d3 = st.columns(3)
             
             # 1. NAME
@@ -93,9 +100,11 @@ if mode == "Single Upload":
 elif mode == "Batch Folder Processing":
     st.title("Batch Processing & Accuracy")
     
-    folder = "Raw_IDs"
+    # Use the robust path from backend
+    folder = RAW_IDS_FOLDER
+    
     if not os.path.exists(folder):
-        st.error(f"Folder '{folder}' not found.")
+        st.error(f"Folder '{folder}' not found. Please ensure 'Raw_IDs' is next to backend.py")
         st.stop()
         
     true_file = st.file_uploader("Upload 'True Results.xlsx' for Accuracy (Optional)", type=['xlsx'])
@@ -150,8 +159,12 @@ elif mode == "Batch Folder Processing":
         
         if results:
             df = pd.DataFrame(results)
-            df['SortKey'] = df['Student ID'].str.extract(r'(\d+)').astype(float)
-            df = df.sort_values('SortKey').drop(columns=['SortKey'])
+            # Safe sorting that handles IDs that might not be purely numeric
+            try:
+                df['SortKey'] = df['Student ID'].str.extract(r'(\d+)').astype(float)
+                df = df.sort_values('SortKey').drop(columns=['SortKey'])
+            except:
+                pass # Skip sorting if regex fails
             
             out_path = "Extracted_Results.xlsx"
             df.to_excel(out_path, index=False)
@@ -167,6 +180,7 @@ elif mode == "Batch Folder Processing":
                     tmp.write(true_file.getvalue())
                     tmp_path = tmp.name
                 
+                # Calculate accuracy
                 report_str = backend.calculate_pipeline_accuracy(tmp_path, out_path)
                 st.text(report_str)
                 
