@@ -47,7 +47,7 @@ STEP_ID-Scanner/
 ├── backend.py          # Core OCR & processing logic
 ├── app.py              # Streamlit app (optional UI)
 ├── STEP_Scanner.ipynb  # Notebook for experimentation & testing
-├── dataset/            # ID card images
+├── Raw_IDs/            # ID card images
 ├── requirements.txt    # Python dependencies
 └── README.md           # Project documentation
 ```
