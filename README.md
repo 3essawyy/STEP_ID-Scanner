@@ -60,7 +60,7 @@ The project includes a **Streamlit-based interactive web UI** that allows runnin
 - **NumPy** – numerical operations
 - **Pandas** – data storage and analysis
 - **Scikit-learn** – SVM & preprocessing
-- **Streamlit** (optional) – simple UI
+- **Streamlit** (optional) – GUI
 
 ---
 
@@ -94,13 +94,10 @@ cd STEP_ID-Scanner
 pip install -r requirements.txt
 ```
 
-3. **Install Tesseract OCR**
-
-- Windows: Install from the official Tesseract installer and add it to PATH
-- Linux:
+3. **Install easyOCR**
 
 ```bash
-sudo apt install tesseract-ocr tesseract-ocr-ara
+pip install easyocr 
 ```
 
 ---
