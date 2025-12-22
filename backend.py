@@ -419,19 +419,23 @@ def calculate_pipeline_accuracy(true_file_path, extracted_file_path):
 
     row_accuracy = (perfect_rows / min_len) * 100 if min_len > 0 else 0.0
 
-    print(f"\n--------------------------------")
-    print(f"AVERAGE ACCURACY: {average_accuracy:.2f}%")
-    print(f"ROW ACCURACY: {row_accuracy:.2f}%")
-    print(f"--------------------------------")
+    # Build report string
+    report_lines = []
+    report_lines.append("\n--------------------------------")
+    report_lines.append(f"AVERAGE ACCURACY: {average_accuracy:.2f}%")
+    report_lines.append(f"ROW ACCURACY: {row_accuracy:.2f}%")
+    report_lines.append("--------------------------------")
     
     if failed_ids:
-        print("\n--- PROBLEMATIC IDS ---")
-        for failed_id in failed_ids:
-            print(failed_id)
+        report_lines.append("\n--- PROBLEMATIC IDS ---")
+        report_lines.extend(failed_ids)
     else:
-        print("\nNo Failures! All rows match perfectly.")
+        report_lines.append("\nNo Failures! All rows match perfectly.")
 
-    return average_accuracy
+    report_str = "\n".join(report_lines)
+    print(report_str)
+    
+    return report_str
 
 # --- PIPELINES ---
 def process_single_id(img, SVMclassifier, reader, ref_path):
