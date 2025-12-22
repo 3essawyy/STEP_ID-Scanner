@@ -139,27 +139,58 @@ def align_images_sift(img_to_align, reference_path):
 
 # --- EXTRACTION ---
 def extract_name_and_digits(aligned_image):
-    name_roi = aligned_image[205:355, 100:1300]
-    code_roi = aligned_image[404:514, 640:975]
-    daf3_roi = aligned_image[500:610, 350:970]
+    name_coords = (100, 205, 1200, 150)
+    code_coords = (640, 404, 335, 110)
+    daf3_coords = (350, 500, 620, 110)
     
+    nx, ny, nw, nh = name_coords
+    cx, cy, cw, ch = code_coords
+    dx, dy, dw, dh = daf3_coords
+    
+    # Extract ROIs
+    name_img = aligned_image[ny:ny+nh, nx:nx+nw]
+    code_roi = aligned_image[cy:cy+ch, cx:cx+cw]
+    daf3_roi = aligned_image[dy:dy+dh, dx:dx+dw]
+    daf3_full = aligned_image[dy:dy+dh, dx:dx+dw]  # Keep full ROI for saving
+    code_full = aligned_image[cy:cy+ch, cx:cx+cw]  # Keep full ROI for saving
+    
+    # --- Helper Function to Process Any ROI ---
     def process_roi_digits(roi_img, digit_limit):
-        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY) if len(roi_img.shape) == 3 else roi_img
+        if len(roi_img.shape) == 3:
+            gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = roi_img
+        
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         candidates = []
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
+            
             if h > 15 and w > 5:
-                if w > 0.8 * h:
-                    candidates.extend([(x, y, w//2, h, (w//2)*h), (x+w//2, y, w//2, h, (w//2)*h)])
+                if w > 0.8 * h: 
+                    half_w = w // 2
+                    candidates.append((x, y, half_w, h, half_w * h))
+                    candidates.append((x + half_w, y, half_w, h, half_w * h))
                 else:
-                    candidates.append((x, y, w, h, w*h))
+                    candidates.append((x, y, w, h, area))
+        
         candidates = sorted(candidates, key=lambda c: c[4], reverse=True)[:digit_limit]
         final_candidates = sorted(candidates, key=lambda c: c[0])
-        return [roi_img[y:y+h, x:x+w] for x, y, w, h, _ in final_candidates]
+        
+        cropped_digits = []
+        for (x, y, w, h, area) in final_candidates:
+            digit_crop = roi_img[y:y+h, x:x+w]
+            cropped_digits.append(digit_crop)
+            
+        return cropped_digits
+    
+    code_digits = process_roi_digits(code_roi, digit_limit=7)
+    daf3_digits = process_roi_digits(daf3_roi, digit_limit=14)
 
-    return name_roi, process_roi_digits(code_roi, 7), process_roi_digits(daf3_roi, 14), daf3_roi, code_roi
+    return name_img, code_digits, daf3_digits, daf3_full, code_full
 
 # --- OCR HELPER (MERGED LOGIC) ---
 def extractname(image_input, reader):
@@ -214,11 +245,11 @@ def save_student_name(student_id, name_img, output_folder="extracted_names"):
     if not os.path.exists(full_out_path): os.makedirs(full_out_path)
     cv2.imwrite(os.path.join(full_out_path, f"{student_id}_name.jpg"), name_img)
 
-def save_split_digits(prefix, digit_imgs, output_folder="extracted_digits"):
-    full_out_path = os.path.join(BACKEND_DIR, output_folder)
+def save_split_digits(student_id, digit_imgs, output_folder="extracted_digits"):
+    full_out_path = os.path.join(BACKEND_DIR, output_folder, student_id)
     if not os.path.exists(full_out_path): os.makedirs(full_out_path)
-    for idx, d_img in enumerate(digit_imgs):
-        cv2.imwrite(os.path.join(full_out_path, f"{prefix}_digit_{idx}.jpg"), d_img)
+    for index, digit_img in enumerate(digit_imgs):
+        cv2.imwrite(os.path.join(full_out_path, f"digit_{index}.jpg"), digit_img)
 
 def extract_hog_features(img):
     if len(img.shape) == 3: img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -228,178 +259,125 @@ def extract_hog_features(img):
 
 def train_SVM_robust():
     if not os.path.exists(PATH_TO_TRAIN_DATASET): return None
-    label_map = {'a': '0', 'b': '1', 'c': '2', 'd': '3', 'e': '4', 'f': '5', 'g': '6', 'h': '7', 'i': '8', 'j': '9'}
-    features, labels = [], []
-    for fn in os.listdir(PATH_TO_TRAIN_DATASET):
-        if not fn.lower().endswith(('.jpg', '.png')): continue
+    
+    label_map = {
+        'a': '0', 'b': '1', 'c': '2', 'd': '3', 'e': '4', 
+        'f': '5', 'g': '6', 'h': '7', 'i': '8', 'j': '9'
+    }
+    
+    features = []
+    labels = []
+    
+    img_filenames = os.listdir(PATH_TO_TRAIN_DATASET)
+    print(f"Loading {len(img_filenames)} training images...")
+
+    for fn in img_filenames:
+        if not fn.lower().endswith(('.jpg', '.png')):
+            continue
+
         prefix = fn[0].lower()
         if prefix in label_map:
-            img = cv2.imread(os.path.join(PATH_TO_TRAIN_DATASET, fn))
-            features.append(extract_hog_features(img))
             labels.append(label_map[prefix])
-    
+            
+            path = os.path.join(PATH_TO_TRAIN_DATASET, fn)
+            img = cv2.imread(path)
+            
+            features.append(extract_hog_features(img))
+
     if not features: return None
-    clf = Pipeline([('scaler', StandardScaler()), ('svc', LinearSVC(random_state=42, dual=False))])
-    clf.fit(features, labels)
+    
+    clf = Pipeline([
+        ('scaler', StandardScaler()),
+        ('svc', LinearSVC(random_state=42, max_iter=5000, dual=False))
+    ])
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, labels, test_size=0.2, random_state=random_seed
+    )
+    
+    clf.fit(X_train, y_train)
+    accuracy = clf.score(X_test, y_test)
+    print(f"Training Complete. Validation Accuracy: {accuracy*100:.2f}%")
+    
     return clf
 
-# --- ACCURACY CALCULATION (UPDATED WITH ROW ACCURACY) ---
+# --- ACCURACY CALCULATION ---
+def _norm_arabic_variants(s: str) -> str:
+    # Treat: ي == ى, and ه == ة (normalize to ي and ه)
+    return (s or "").replace("ى", "ي").replace("ة", "ه")
+
 def calculate_pipeline_accuracy(true_file_path, extracted_file_path):
-    # 1. Load the Excel files
     try:
-        # Load files (Sheet 1 is default, which is what we want now)
         df_true = pd.read_excel(true_file_path)
         df_extracted = pd.read_excel(extracted_file_path)
     except Exception as e:
         print(f"Error loading files: {e}")
-        return "Error loading files."
+        return 0.0
 
-    # --- CRITICAL FIX: Clean Column Names ---
-    # This removes leading/trailing spaces from headers (e.g., ' Name' -> 'Name')
     df_true.columns = df_true.columns.str.strip()
     df_extracted.columns = df_extracted.columns.str.strip()
 
-    # 2. Align the data lengths
     min_len = min(len(df_true), len(df_extracted))
     df_true = df_true.iloc[:min_len].reset_index(drop=True)
     df_extracted = df_extracted.iloc[:min_len].reset_index(drop=True)
 
-    # Use the clean names now
     columns_to_check = ['Code', 'Daf3', 'Name']
     scores = {}
-    
-    # Store string report to return to Streamlit
-    report_lines = []
-    report_lines.append(f"--- Accuracy Report (Checking {min_len} rows) ---")
 
-    # Arrays to track correctness per row for Row Accuracy
-    row_flags = {
-        'Code': [False] * min_len,
-        'Daf3': [False] * min_len,
-        'Name': [False] * min_len
-    }
+    print(f"--- Accuracy Report (Checking {min_len} rows) ---\n")
 
     for col in columns_to_check:
-        # Check if column exists (now robust to spaces)
         if col not in df_true.columns or col not in df_extracted.columns:
-            msg = f"Error: Column '{col}' missing."
-            print(msg)
-            report_lines.append(msg)
+            print(f"Error: Column '{col}' missing.")
+            print(f"   Available in True File: {df_true.columns.tolist()}")
+            print(f"   Available in Extracted: {df_extracted.columns.tolist()}")
             scores[col] = 0.0
             continue
 
-        # --- Data Normalization ---
         true_series = df_true[col].astype(str).fillna('')
         extracted_series = df_extracted[col].astype(str).fillna('')
 
         true_clean = true_series.str.strip().str.replace(r'\.0$', '', regex=True)
         extracted_clean = extracted_series.str.strip().str.replace(r'\.0$', '', regex=True)
 
-        # --- COMPARISON LOGIC ---
         if col == 'Name':
             row_scores = []
-            
-            for i, (t_val, e_val) in enumerate(zip(true_clean, extracted_clean)):
-                
-                # --- CHECK 1: STRICT ONE-SPACE TOLERANCE ---
+
+            for t_val, e_val in zip(true_clean, extracted_clean):
+                t_val = _norm_arabic_variants(t_val)
+                e_val = _norm_arabic_variants(e_val)
+
                 t_nospace = t_val.replace(" ", "")
                 e_nospace = e_val.replace(" ", "")
-                
-                is_correct = False
-                
-                # Perfect match
+
                 if t_val == e_val:
                     row_scores.append(1.0)
-                    is_correct = True
-                    
-                # Match if characters are same AND length differs by only 1
                 elif (t_nospace == e_nospace) and (abs(len(t_val) - len(e_val)) <= 1):
-                    row_scores.append(1.0) 
-                    is_correct = True
-                    
-                # --- CHECK 2: Fallback (Partial Word Match) ---
+                    row_scores.append(1.0)
                 else:
                     t_words = set(t_val.split())
                     e_words = set(e_val.split())
-                    
                     if len(t_words) == 0:
-                        val = 1.0 if len(e_words) == 0 else 0.0
-                        row_scores.append(val)
-                        if val == 1.0: is_correct = True
+                        row_scores.append(1.0 if len(e_words) == 0 else 0.0)
                     else:
                         common = t_words.intersection(e_words)
-                        score = len(common) / len(t_words)
-                        row_scores.append(score)
-                        # We consider it a "Row Match" only if score is 1.0 (all words found)
-                        if score >= 1.0: is_correct = True
-                
-                row_flags['Name'][i] = is_correct
-            
+                        row_scores.append(len(common) / len(t_words))
+
             accuracy = np.mean(row_scores) * 100
-            
         else:
-            # === STRICT COMPARISON FOR CODES ===
-            matches = (true_clean == extracted_clean) 
+            matches = (true_clean == extracted_clean)
             accuracy = (matches.sum() / len(matches)) * 100
-            
-            # Store booleans for Row Accuracy
-            for i, m in enumerate(matches):
-                row_flags[col][i] = m
 
         scores[col] = accuracy
-        line = f"{col} Accuracy: {accuracy:.2f}%"
-        print(line)
-        report_lines.append(line)
+        print(f"{col} Accuracy: {accuracy:.2f}%")
 
-    # 3. Calculate Average
-    if scores:
-        average_accuracy = sum(scores.values()) / len(scores)
-    else:
-        average_accuracy = 0.0
+    average_accuracy = (sum(scores.values()) / len(scores)) if scores else 0.0
 
-    # --- 4. CALCULATE ROW ACCURACY (New Addition) ---
-    perfect_rows = 0
-    failed_ids = []
-    
-    # Try to find ID column for reporting failures
-    id_col = 'Student ID' if 'Student ID' in df_extracted.columns else df_extracted.columns[0]
-
-    for i in range(min_len):
-        c_ok = row_flags['Code'][i]
-        d_ok = row_flags['Daf3'][i]
-        n_ok = row_flags['Name'][i]
-        
-        if c_ok and d_ok and n_ok:
-            perfect_rows += 1
-        else:
-            # Generate failure report for this row
-            reasons = []
-            if not c_ok: reasons.append("Code")
-            if not d_ok: reasons.append("Daf3")
-            if not n_ok: reasons.append("Name")
-            sid = df_extracted.iloc[i][id_col]
-            failed_ids.append(f"ID: {sid} | Failed: {', '.join(reasons)}")
-
-    row_accuracy = (perfect_rows / min_len) * 100 if min_len > 0 else 0.0
-
-    # Print to console (as per user snippet)
     print(f"\n--------------------------------")
-    print(f"AVERAGE COLUMN ACCURACY: {average_accuracy:.2f}%")
-    print(f"ROW ACCURACY: {row_accuracy:.2f}%")
+    print(f"AVERAGE ACCURACY: {average_accuracy:.2f}%")
     print(f"--------------------------------")
 
-    # Add to report string for Streamlit
-    report_lines.append("-" * 20)
-    report_lines.append(f"AVERAGE ACCURACY: {average_accuracy:.2f}%")
-    report_lines.append(f"ROW ACCURACY: {row_accuracy:.2f}%")
-    
-    if failed_ids:
-        report_lines.append("\n--- PROBLEMATIC IDS ---")
-        report_lines.append("\n".join(failed_ids))
-    else:
-        report_lines.append("\nNo Failures! All rows match perfectly.")
-
-    return "\n".join(report_lines)
+    return average_accuracy
 
 # --- PIPELINES ---
 def process_single_id(img, SVMclassifier, reader, ref_path):
