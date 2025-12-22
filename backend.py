@@ -323,6 +323,13 @@ def calculate_pipeline_accuracy(true_file_path, extracted_file_path):
 
     columns_to_check = ['Code', 'Daf3', 'Name']
     scores = {}
+    
+    # Track correctness for each row
+    row_flags = {
+        'Code': [False] * min_len,
+        'Daf3': [False] * min_len,
+        'Name': [False] * min_len
+    }
 
     print(f"--- Accuracy Report (Checking {min_len} rows) ---\n")
 
@@ -343,39 +350,86 @@ def calculate_pipeline_accuracy(true_file_path, extracted_file_path):
         if col == 'Name':
             row_scores = []
 
-            for t_val, e_val in zip(true_clean, extracted_clean):
+            for i, (t_val, e_val) in enumerate(zip(true_clean, extracted_clean)):
                 t_val = _norm_arabic_variants(t_val)
                 e_val = _norm_arabic_variants(e_val)
 
                 t_nospace = t_val.replace(" ", "")
                 e_nospace = e_val.replace(" ", "")
+                
+                is_correct = False
 
                 if t_val == e_val:
                     row_scores.append(1.0)
+                    is_correct = True
                 elif (t_nospace == e_nospace) and (abs(len(t_val) - len(e_val)) <= 1):
                     row_scores.append(1.0)
+                    is_correct = True
                 else:
                     t_words = set(t_val.split())
                     e_words = set(e_val.split())
                     if len(t_words) == 0:
-                        row_scores.append(1.0 if len(e_words) == 0 else 0.0)
+                        val = 1.0 if len(e_words) == 0 else 0.0
+                        row_scores.append(val)
+                        if val == 1.0: is_correct = True
                     else:
                         common = t_words.intersection(e_words)
-                        row_scores.append(len(common) / len(t_words))
+                        score = len(common) / len(t_words)
+                        row_scores.append(score)
+                        if score >= 1.0: is_correct = True
+                
+                row_flags['Name'][i] = is_correct
 
             accuracy = np.mean(row_scores) * 100
         else:
             matches = (true_clean == extracted_clean)
             accuracy = (matches.sum() / len(matches)) * 100
+            
+            # Track correctness for Code and Daf3
+            for i, m in enumerate(matches):
+                row_flags[col][i] = m
 
         scores[col] = accuracy
         print(f"{col} Accuracy: {accuracy:.2f}%")
 
     average_accuracy = (sum(scores.values()) / len(scores)) if scores else 0.0
 
+    # --- CALCULATE ROW ACCURACY ---
+    perfect_rows = 0
+    failed_ids = []
+    
+    # Try to find ID column for reporting
+    id_col = 'Student ID' if 'Student ID' in df_extracted.columns else df_extracted.columns[0]
+
+    for i in range(min_len):
+        c_ok = row_flags['Code'][i]
+        d_ok = row_flags['Daf3'][i]
+        n_ok = row_flags['Name'][i]
+        
+        if c_ok and d_ok and n_ok:
+            perfect_rows += 1
+        else:
+            # Generate failure report for this row
+            reasons = []
+            if not c_ok: reasons.append("Code")
+            if not d_ok: reasons.append("Daf3")
+            if not n_ok: reasons.append("Name")
+            sid = df_extracted.iloc[i][id_col]
+            failed_ids.append(f"ID: {sid} | Failed: {', '.join(reasons)}")
+
+    row_accuracy = (perfect_rows / min_len) * 100 if min_len > 0 else 0.0
+
     print(f"\n--------------------------------")
     print(f"AVERAGE ACCURACY: {average_accuracy:.2f}%")
+    print(f"ROW ACCURACY: {row_accuracy:.2f}%")
     print(f"--------------------------------")
+    
+    if failed_ids:
+        print("\n--- PROBLEMATIC IDS ---")
+        for failed_id in failed_ids:
+            print(failed_id)
+    else:
+        print("\nNo Failures! All rows match perfectly.")
 
     return average_accuracy
 
