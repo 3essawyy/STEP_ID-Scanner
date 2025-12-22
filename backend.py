@@ -444,10 +444,20 @@ def process_single_id(img, SVMclassifier, reader, ref_path):
     img = align_images_sift(img, ref_path)
     img, _ = is_random_noise(img)
     img = enhance_contrast_clahe(img)
+    
+    # Apply sharpening kernel (matches notebook)
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    img = cv2.filter2D(img, -1, kernel)
+    
     name_img, code_digits, daf3_digits, daf3_full, code_full = extract_name_and_digits(img)
     
     code_txt = ''.join([str(SVMclassifier.predict([extract_hog_features(d)])[0]) for d in code_digits])
     daf3_txt = ''.join([str(SVMclassifier.predict([extract_hog_features(d)])[0]) for d in daf3_digits])
+    
+    # Save name image first, then read from file (matches notebook behavior)
+    # This will be done by main_pipeline after calling process_single_id
     name_txt = extractname(name_img, reader)
 
     return {
@@ -472,13 +482,17 @@ def main_pipeline():
         raw = cv2.imread(path)
         res = process_single_id(raw, svm, reader, REF_IMG_PATH)
         
-        # Save Crops (Needed for main_pipeline behavior)
+        # Save Crops
         sid = os.path.splitext(fn)[0]
         save_student_name(sid, res['name_image'])
         save_split_digits(sid, res['digit_imgs'])
         save_split_digits(f"{sid}_daf3", res['daf3_digit_imgs'], "extracted_daf3_digits")
         
-        data.append({"Student ID": sid, "Name": res['name_text'], "Code": res['code_text'], "Daf3": res['daf3_text']})
+        # Read name from saved file (matches notebook behavior)
+        name_path = os.path.join(BACKEND_DIR, "extracted_names", f"{sid}_name.jpg")
+        name_txt = extractname(name_path, reader)
+        
+        data.append({"Student ID": sid, "Name": name_txt, "Code": res['code_text'], "Daf3": res['daf3_text']})
         print(f"Processed {sid}")
         
     df = pd.DataFrame(data)
