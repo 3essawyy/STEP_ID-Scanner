@@ -3,226 +3,213 @@ import numpy as np
 import os
 import easyocr
 import pandas as pd
+import csv
 from sklearn.svm import LinearSVC
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
 # --- 1. ROBUST PATH CONFIGURATION ---
-# This gets the exact folder where backend.py is located
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Define absolute paths based on the backend file location
 PATH_TO_TRAIN_DATASET = os.path.join(BACKEND_DIR, "train_digits")
 PATH_TO_RAW_IDS = os.path.join(BACKEND_DIR, "Raw_IDs")
 REF_IMG_PATH = os.path.join(BACKEND_DIR, "Raw_IDs", "ID14.jpg")
-
-# Debugging: Print where we are strictly looking
-print(f"[BACKEND] Backend File is at: {BACKEND_DIR}")
-print(f"[BACKEND] Looking for 'train_digits' at: {PATH_TO_TRAIN_DATASET}")
-print(f"[BACKEND] Looking for 'Raw_IDs' at: {PATH_TO_RAW_IDS}")
+NAME_LEXICON_CSV = os.path.join(BACKEND_DIR, "name_labels.csv") 
 
 # --- CONFIGURATION ---
 TARGET_IMG_SIZE = (32, 32)
 random_seed = 42 
 
-# --- NOISE & CONTRAST (EXACT ORIGINALS) ---
+# --- EASYOCR CONFIGURATION ---
+EASYOCR_READTEXT_KWARGS = dict(
+    detail=1,
+    paragraph=False,
+    decoder="beamsearch",
+    beamWidth=5,
+    batch_size=1,
+    text_threshold=0.55,
+    low_text=0.30,
+    link_threshold=0.35,
+    contrast_ths=0.08,
+    adjust_contrast=0.7,
+    mag_ratio=2.0,
+)
 
+# --- LEXICON HELPERS ---
+_NAME_LEXICON = None
+
+def _load_name_lexicon():
+    global _NAME_LEXICON
+    if _NAME_LEXICON is not None:
+        return _NAME_LEXICON
+    lex = []
+    if os.path.exists(NAME_LEXICON_CSV):
+        try:
+            with open(NAME_LEXICON_CSV, "r", encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f):
+                    v = (row.get("transcription") or row.get("Name") or "").strip()
+                    if v:
+                        lex.append(v)
+            print(f"[BACKEND] Loaded lexicon with {len(lex)} entries.")
+        except Exception as e:
+            print(f"[BACKEND] Error loading lexicon: {e}")
+            lex = []
+    
+    _NAME_LEXICON = lex
+    return _NAME_LEXICON
+
+def _norm_dl(s: str) -> str:
+    return (s or "").replace("د", "X").replace("ل", "X")
+
+def _levenshtein(a: str, b: str) -> int:
+    a, b = a or "", b or ""
+    n, m = len(a), len(b)
+    if n == 0: return m
+    if m == 0: return n
+    prev = list(range(m + 1))
+    for i in range(1, n + 1):
+        curr = [i] + [0] * m
+        ca = a[i - 1]
+        for j in range(1, m + 1):
+            cb = b[j - 1]
+            cost = 0 if ca == cb else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[m]
+
+def _correct_with_lexicon_dl(pred: str) -> str:
+    lex = _load_name_lexicon()
+    if not pred or not lex:
+        return pred
+    p = _norm_dl(pred)
+    best_name, best_dist = pred, 10**9
+    for cand in lex:
+        d = _levenshtein(p, _norm_dl(cand))
+        if d < best_dist:
+            best_dist, best_name = d, cand
+    
+    tol = max(2, int(0.18 * max(len(best_name), 1)))
+    return best_name if best_dist <= tol else pred
+
+# --- NOISE & CONTRAST ---
 def is_impulsive_noise(img, threshold=0.1, black_range=(0, 9), white_range=(246, 255)):
-    if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
+    if len(img.shape) == 3: img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     total_pixels = img.size
     is_pepper = (img >= black_range[0]) & (img <= black_range[1])
     is_salt = (img >= white_range[0]) & (img <= white_range[1])
-    
     noise_mask = is_pepper | is_salt
-    num_noise_pixels = np.sum(noise_mask)
-    prop = num_noise_pixels / total_pixels
-
-    if prop < threshold:
-        return img, False 
-
-    k = int(3 + prop * 10)
+    if (np.sum(noise_mask) / total_pixels) < threshold: return img, False 
+    k = int(3 + (np.sum(noise_mask) / total_pixels) * 10)
     if k % 2 == 0: k += 1
-    k = min(max(k, 3), 9)
-
-    median_filtered = cv2.medianBlur(img, k)
-    treated_img = img.copy()
-    treated_img[noise_mask] = median_filtered[noise_mask]
-
-    return treated_img, True
+    median = cv2.medianBlur(img, min(max(k, 3), 9))
+    treated = img.copy()
+    treated[noise_mask] = median[noise_mask]
+    return treated, True
 
 def is_random_noise(img, threshold=0.1):
-    if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-    stddev = np.std(img)
-    normalized_stddev = stddev / 255.0
-
-    if normalized_stddev < threshold:
-        return img, False
-    treated_img = cv2.fastNlMeansDenoising(
-        img, 
-        None, 
-        h=10, 
-        templateWindowSize=7, 
-        searchWindowSize=21
-    )
-    
-    return treated_img, True
+    if len(img.shape) == 3: img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.fastNlMeansDenoising(img, None, h=10, templateWindowSize=7, searchWindowSize=21), True
 
 def enhance_contrast_clahe(img, clip_limit=2.0, tile_size=(8, 8)):
     if len(img.shape) == 3:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
-        cl = clahe.apply(l)
-        enhanced_lab = cv2.merge((cl, a, b))
-        return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
-    else:
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
-        return clahe.apply(img)
+        l, a, b = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2LAB))
+        l = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size).apply(l)
+        return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size).apply(img)
 
-# --- ALIGNMENT (EXACT ORIGINAL) ---
-
+# --- ALIGNMENT ---
 def align_images_sift(img_to_align, reference_path):
-    # Ensure we use the robust path if reference_path is just a filename
-    if not os.path.exists(reference_path) and os.path.exists(REF_IMG_PATH):
-        reference_path = REF_IMG_PATH
-
+    if not os.path.exists(reference_path) and os.path.exists(REF_IMG_PATH): reference_path = REF_IMG_PATH
     img1 = img_to_align
-    img2 = cv2.imread(reference_path) # Train Image
-    
-    if img2 is None: 
-        return img_to_align
-
-    if len(img1.shape) == 3:
-        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-    else:
-        gray1 = img1 
-
-    if len(img2.shape) == 3:
-        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
-    else:
-        gray2 = img2
-
+    img2 = cv2.imread(reference_path)
+    if img2 is None: return img_to_align
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if len(img1.shape) == 3 else img1
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if len(img2.shape) == 3 else img2
     sift = cv2.SIFT_create() 
     kp1, des1 = sift.detectAndCompute(gray1, None)
     kp2, des2 = sift.detectAndCompute(gray2, None)
-
-    bf = cv2.BFMatcher()
-    matches = bf.knnMatch(des1, des2, k=2)
-
-    good_matches = []
-    for m, n in matches:
-        if m.distance < 0.75 * n.distance:
-            good_matches.append(m)
-
-    if len(good_matches) > 10:
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-        h, w = img2.shape[:2]
-        aligned_img = cv2.warpPerspective(img1, M, (w, h))
-        return aligned_img
-    else:
-        print(f"Not enough matches found: {len(good_matches)}/10")
-        return img1
+    matches = cv2.BFMatcher().knnMatch(des1, des2, k=2)
+    good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    if len(good) > 10:
+        src = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        M, _ = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+        return cv2.warpPerspective(img_to_align, M, (img2.shape[1], img2.shape[0]))
+    return img1
 
 # --- EXTRACTION ---
-
 def extract_name_and_digits(aligned_image):
-    name_coords = (100, 205, 1200, 150)
-    code_coords = (640, 404, 335, 110)
-    daf3_coords = (350, 500, 620, 110)
-    
-    nx, ny, nw, nh = name_coords
-    cx, cy, cw, ch = code_coords
-    dx, dy, dw, dh = daf3_coords
-    
-    name_img = aligned_image[ny:ny+nh, nx:nx+nw]
-    code_roi = aligned_image[cy:cy+ch, cx:cx+cw]
-    daf3_img = aligned_image[dy:dy+dh, dx:dx+dw]
+    name_roi = aligned_image[205:355, 100:1300]
+    code_roi = aligned_image[404:514, 640:975]
+    daf3_roi = aligned_image[500:610, 350:970]
     
     def process_roi_digits(roi_img, digit_limit):
-        if len(roi_img.shape) == 3:
-            gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = roi_img
-        
+        gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY) if len(roi_img.shape) == 3 else roi_img
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
         candidates = []
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
-            area = w * h
             if h > 15 and w > 5:
-                if w > 0.8 * h: 
-                    half_w = w // 2
-                    candidates.append((x, y, half_w, h, half_w * h))
-                    candidates.append((x + half_w, y, half_w, h, half_w * h))
+                if w > 0.8 * h:
+                    candidates.extend([(x, y, w//2, h, (w//2)*h), (x+w//2, y, w//2, h, (w//2)*h)])
                 else:
-                    candidates.append((x, y, w, h, area))
-        
+                    candidates.append((x, y, w, h, w*h))
         candidates = sorted(candidates, key=lambda c: c[4], reverse=True)[:digit_limit]
         final_candidates = sorted(candidates, key=lambda c: c[0])
-        
-        cropped_digits = []
-        for (x, y, w, h, area) in final_candidates:
-            digit_crop = roi_img[y:y+h, x:x+w]
-            cropped_digits.append(digit_crop)
-            
-        return cropped_digits
+        return [roi_img[y:y+h, x:x+w] for x, y, w, h, _ in final_candidates]
 
-    code_digits = process_roi_digits(code_roi, digit_limit=7)
-    daf3_digits = process_roi_digits(daf3_img, digit_limit=14)
+    return name_roi, process_roi_digits(code_roi, 7), process_roi_digits(daf3_roi, 14), daf3_roi, code_roi
 
-    return name_img, code_digits, daf3_digits, daf3_img, code_roi
-# --- OCR HELPER (Updated for Exact Notebook Match) ---
+# --- OCR HELPER (MERGED LOGIC) ---
 def extractname(image_input, reader):
     """
-    Reads text using EasyOCR.
-    1. If input is a path, read directly (Batch Mode).
-    2. If input is an array (Single Mode), compress to JPG in memory first
-       to simulate the 'save to disk' step from the notebook.
+    Reads text using EasyOCR with Beamsearch and Lexicon Correction.
     """
     try:
-        # CASE A: It's a file path (Batch Mode) -> Pass path string directly
+        image_to_read = None
+        # 1. PREPARE IMAGE (JPG SIMULATION)
         if isinstance(image_input, str):
-            results = reader.readtext(image_input, detail=0, paragraph=True)
-        
-        # CASE B: It's an image array (Single Mode)
+            image_to_read = image_input
         elif isinstance(image_input, np.ndarray):
-            # 1. Convert BGR to RGB (Just in case)
             if len(image_input.shape) == 3:
                 image_input = cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
-            
-            # 2. CRITICAL: Encode to JPG in memory to simulate file saving
-            # This adds the exact same compression artifacts as cv2.imwrite
             success, encoded_img = cv2.imencode('.jpg', image_input)
-            
             if success:
-                # Pass the compressed bytes to EasyOCR
-                results = reader.readtext(encoded_img.tobytes(), detail=0, paragraph=True)
+                image_to_read = encoded_img.tobytes()
             else:
-                # Fallback to raw array if encoding fails
-                results = reader.readtext(image_input, detail=0, paragraph=True)
-            
+                image_to_read = image_input
         else:
             return ""
 
-        # Join results exactly like the notebook
-        full_name = " ".join(results)
-        return full_name.strip()
+        # 2. READ TEXT
+        results = reader.readtext(image_to_read, **EASYOCR_READTEXT_KWARGS)
+
+        # 3. PARSE & SORT
+        items = []
+        for r in results:
+            try:
+                bbox, text, conf = r
+                if not isinstance(text, str): continue
+                text = text.strip()
+                if len(text) < 2: continue
+                cx = float(np.mean([p[0] for p in bbox]))
+                items.append((cx, text))
+            except: continue
+
+        items.sort(key=lambda t: t[0], reverse=True)
+        joined = " ".join([t for _, t in items]).strip()
+
+        # 4. LEXICON CORRECTION
+        out = _correct_with_lexicon_dl(joined)
+        return out.strip()
         
     except Exception as e:
         print(f"EasyOCR Error: {e}")
         return ""
-# --- SAVING HELPERS ---
+
+# --- SAVING & TRAINING ---
 def save_student_name(student_id, name_img, output_folder="extracted_names"):
-    # Ensure output folder is relative to backend to avoid path errors
     full_out_path = os.path.join(BACKEND_DIR, output_folder)
     if not os.path.exists(full_out_path): os.makedirs(full_out_path)
     cv2.imwrite(os.path.join(full_out_path, f"{student_id}_name.jpg"), name_img)
@@ -233,248 +220,240 @@ def save_split_digits(prefix, digit_imgs, output_folder="extracted_digits"):
     for idx, d_img in enumerate(digit_imgs):
         cv2.imwrite(os.path.join(full_out_path, f"{prefix}_digit_{idx}.jpg"), d_img)
 
-# --- TRAINING (UPDATED TO USE ROBUST PATHS) ---
-
 def extract_hog_features(img):
-    if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if len(img.shape) == 3: img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     img = cv2.resize(img, (32, 32)) 
-    
-    hog = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
-    h = hog.compute(img)
-    return h.flatten()
+    return cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9).compute(img).flatten()
 
 def train_SVM_robust():
-    # USES THE GLOBALLY DEFINED ROBUST PATH
-    if not os.path.exists(PATH_TO_TRAIN_DATASET):
-        print(f"[ERROR] Could not find dataset at: {PATH_TO_TRAIN_DATASET}")
-        return None
-
-    label_map = {
-        'a': '0', 'b': '1', 'c': '2', 'd': '3', 'e': '4', 
-        'f': '5', 'g': '6', 'h': '7', 'i': '8', 'j': '9'
-    }
-    
-    features = []
-    labels = []
-    
-    img_filenames = os.listdir(PATH_TO_TRAIN_DATASET)
-    print(f"Loading {len(img_filenames)} training images...")
-
-    for fn in img_filenames:
-        if not fn.lower().endswith(('.jpg', '.png')):
-            continue
-
+    if not os.path.exists(PATH_TO_TRAIN_DATASET): return None
+    label_map = {'a': '0', 'b': '1', 'c': '2', 'd': '3', 'e': '4', 'f': '5', 'g': '6', 'h': '7', 'i': '8', 'j': '9'}
+    features, labels = [], []
+    for fn in os.listdir(PATH_TO_TRAIN_DATASET):
+        if not fn.lower().endswith(('.jpg', '.png')): continue
         prefix = fn[0].lower()
         if prefix in label_map:
-            labels.append(label_map[prefix])
-            path = os.path.join(PATH_TO_TRAIN_DATASET, fn)
-            img = cv2.imread(path)
+            img = cv2.imread(os.path.join(PATH_TO_TRAIN_DATASET, fn))
             features.append(extract_hog_features(img))
+            labels.append(label_map[prefix])
     
-    if len(features) == 0:
-        print("[ERROR] No images found! Check your folder content.")
-        return None
-
-    clf = Pipeline([
-        ('scaler', StandardScaler()),
-        ('svc', LinearSVC(random_state=42, max_iter=5000, dual=False))
-    ])
-    
-    X_train, X_test, y_train, y_test = train_test_split(
-        features, labels, test_size=0.2, random_state=random_seed
-    )
-    
-    clf.fit(X_train, y_train)
-    accuracy = clf.score(X_test, y_test)
-    print(f"Training Complete. Validation Accuracy: {accuracy*100:.2f}%")
-    
+    if not features: return None
+    clf = Pipeline([('scaler', StandardScaler()), ('svc', LinearSVC(random_state=42, dual=False))])
+    clf.fit(features, labels)
     return clf
 
-# --- ACCURACY CALCULATION ---
+# --- ACCURACY CALCULATION (UPDATED WITH ROW ACCURACY) ---
 def calculate_pipeline_accuracy(true_file_path, extracted_file_path):
+    # 1. Load the Excel files
     try:
+        # Load files (Sheet 1 is default, which is what we want now)
         df_true = pd.read_excel(true_file_path)
         df_extracted = pd.read_excel(extracted_file_path)
-    except Exception as e: return f"Error: {e}"
+    except Exception as e:
+        print(f"Error loading files: {e}")
+        return "Error loading files."
 
+    # --- CRITICAL FIX: Clean Column Names ---
+    # This removes leading/trailing spaces from headers (e.g., ' Name' -> 'Name')
     df_true.columns = df_true.columns.str.strip()
     df_extracted.columns = df_extracted.columns.str.strip()
+
+    # 2. Align the data lengths
     min_len = min(len(df_true), len(df_extracted))
-    df_true, df_extracted = df_true.iloc[:min_len], df_extracted.iloc[:min_len]
+    df_true = df_true.iloc[:min_len].reset_index(drop=True)
+    df_extracted = df_extracted.iloc[:min_len].reset_index(drop=True)
 
-    report = [f"--- Accuracy Report ({min_len} rows) ---"]
-    row_flags = {'Code': [False]*min_len, 'Daf3': [False]*min_len, 'Name': [False]*min_len}
+    # Use the clean names now
+    columns_to_check = ['Code', 'Daf3', 'Name']
     scores = {}
+    
+    # Store string report to return to Streamlit
+    report_lines = []
+    report_lines.append(f"--- Accuracy Report (Checking {min_len} rows) ---")
 
-    for col in ['Code', 'Daf3', 'Name']:
-        if col not in df_true.columns or col not in df_extracted.columns: continue
-        t_vals = df_true[col].astype(str).fillna('').str.strip().str.replace(r'\.0$', '', regex=True)
-        e_vals = df_extracted[col].astype(str).fillna('').str.strip().str.replace(r'\.0$', '', regex=True)
+    # Arrays to track correctness per row for Row Accuracy
+    row_flags = {
+        'Code': [False] * min_len,
+        'Daf3': [False] * min_len,
+        'Name': [False] * min_len
+    }
 
+    for col in columns_to_check:
+        # Check if column exists (now robust to spaces)
+        if col not in df_true.columns or col not in df_extracted.columns:
+            msg = f"Error: Column '{col}' missing."
+            print(msg)
+            report_lines.append(msg)
+            scores[col] = 0.0
+            continue
+
+        # --- Data Normalization ---
+        true_series = df_true[col].astype(str).fillna('')
+        extracted_series = df_extracted[col].astype(str).fillna('')
+
+        true_clean = true_series.str.strip().str.replace(r'\.0$', '', regex=True)
+        extracted_clean = extracted_series.str.strip().str.replace(r'\.0$', '', regex=True)
+
+        # --- COMPARISON LOGIC ---
         if col == 'Name':
-            c_scores = []
-            for i, (t, e) in enumerate(zip(t_vals, e_vals)):
-                t_n, e_n = t.replace(" ", ""), e.replace(" ", "")
-                if t == e or (t_n == e_n and abs(len(t)-len(e)) <= 1): val = 1.0
+            row_scores = []
+            
+            for i, (t_val, e_val) in enumerate(zip(true_clean, extracted_clean)):
+                
+                # --- CHECK 1: STRICT ONE-SPACE TOLERANCE ---
+                t_nospace = t_val.replace(" ", "")
+                e_nospace = e_val.replace(" ", "")
+                
+                is_correct = False
+                
+                # Perfect match
+                if t_val == e_val:
+                    row_scores.append(1.0)
+                    is_correct = True
+                    
+                # Match if characters are same AND length differs by only 1
+                elif (t_nospace == e_nospace) and (abs(len(t_val) - len(e_val)) <= 1):
+                    row_scores.append(1.0) 
+                    is_correct = True
+                    
+                # --- CHECK 2: Fallback (Partial Word Match) ---
                 else:
-                    ts, es = set(t.split()), set(e.split())
-                    val = (len(ts & es) / len(ts)) if ts else (1.0 if not es else 0.0)
-                c_scores.append(val)
-                row_flags['Name'][i] = (val >= 1.0)
-            acc = np.mean(c_scores) * 100
+                    t_words = set(t_val.split())
+                    e_words = set(e_val.split())
+                    
+                    if len(t_words) == 0:
+                        val = 1.0 if len(e_words) == 0 else 0.0
+                        row_scores.append(val)
+                        if val == 1.0: is_correct = True
+                    else:
+                        common = t_words.intersection(e_words)
+                        score = len(common) / len(t_words)
+                        row_scores.append(score)
+                        # We consider it a "Row Match" only if score is 1.0 (all words found)
+                        if score >= 1.0: is_correct = True
+                
+                row_flags['Name'][i] = is_correct
+            
+            accuracy = np.mean(row_scores) * 100
+            
         else:
-            matches = (t_vals == e_vals)
-            acc = matches.mean() * 100
-            for i, m in enumerate(matches): row_flags[col][i] = m
-        scores[col] = acc
-        report.append(f"{col} Accuracy: {acc:.2f}%")
+            # === STRICT COMPARISON FOR CODES ===
+            matches = (true_clean == extracted_clean) 
+            accuracy = (matches.sum() / len(matches)) * 100
+            
+            # Store booleans for Row Accuracy
+            for i, m in enumerate(matches):
+                row_flags[col][i] = m
 
-    perfect = 0
-    failed = []
+        scores[col] = accuracy
+        line = f"{col} Accuracy: {accuracy:.2f}%"
+        print(line)
+        report_lines.append(line)
+
+    # 3. Calculate Average
+    if scores:
+        average_accuracy = sum(scores.values()) / len(scores)
+    else:
+        average_accuracy = 0.0
+
+    # --- 4. CALCULATE ROW ACCURACY (New Addition) ---
+    perfect_rows = 0
+    failed_ids = []
+    
+    # Try to find ID column for reporting failures
     id_col = 'Student ID' if 'Student ID' in df_extracted.columns else df_extracted.columns[0]
+
     for i in range(min_len):
-        if row_flags['Code'][i] and row_flags['Daf3'][i] and row_flags['Name'][i]: perfect += 1
+        c_ok = row_flags['Code'][i]
+        d_ok = row_flags['Daf3'][i]
+        n_ok = row_flags['Name'][i]
+        
+        if c_ok and d_ok and n_ok:
+            perfect_rows += 1
         else:
-            reasons = [k for k in ['Code','Daf3','Name'] if not row_flags[k][i]]
-            failed.append(f"ID: {df_extracted.iloc[i][id_col]} | Failed: {', '.join(reasons)}")
+            # Generate failure report for this row
+            reasons = []
+            if not c_ok: reasons.append("Code")
+            if not d_ok: reasons.append("Daf3")
+            if not n_ok: reasons.append("Name")
+            sid = df_extracted.iloc[i][id_col]
+            failed_ids.append(f"ID: {sid} | Failed: {', '.join(reasons)}")
 
-    report.append("-" * 20)
-    report.append(f"ROW ACCURACY: {(perfect/min_len)*100:.2f}%")
-    if failed: report.append("\n--- PROBLEMATIC IDS ---\n" + "\n".join(failed))
-    else: report.append("\nNo Failures!")
-    return "\n".join(report)
+    row_accuracy = (perfect_rows / min_len) * 100 if min_len > 0 else 0.0
 
-# --- SINGLE PROCESSOR (For Dashboard) ---
+    # Print to console (as per user snippet)
+    print(f"\n--------------------------------")
+    print(f"AVERAGE COLUMN ACCURACY: {average_accuracy:.2f}%")
+    print(f"ROW ACCURACY: {row_accuracy:.2f}%")
+    print(f"--------------------------------")
 
+    # Add to report string for Streamlit
+    report_lines.append("-" * 20)
+    report_lines.append(f"AVERAGE ACCURACY: {average_accuracy:.2f}%")
+    report_lines.append(f"ROW ACCURACY: {row_accuracy:.2f}%")
+    
+    if failed_ids:
+        report_lines.append("\n--- PROBLEMATIC IDS ---")
+        report_lines.append("\n".join(failed_ids))
+    else:
+        report_lines.append("\nNo Failures! All rows match perfectly.")
+
+    return "\n".join(report_lines)
+
+# --- PIPELINES ---
 def process_single_id(img, SVMclassifier, reader, ref_path):
-    # Use global REF path if local one is bad
     if not os.path.exists(ref_path): ref_path = REF_IMG_PATH
-
     img, _ = is_impulsive_noise(img)
     img = align_images_sift(img, ref_path)
     img, _ = is_random_noise(img)
     img = enhance_contrast_clahe(img)
-    
-    # Unpack 5 values
     name_img, code_digits, daf3_digits, daf3_full, code_full = extract_name_and_digits(img)
     
-    digit_preds = []
-    for digit_img in code_digits:
-        feat = extract_hog_features(digit_img)
-        pred = SVMclassifier.predict([feat])[0]
-        digit_preds.append(str(pred))
-    code_txt = ''.join(digit_preds)
-
-    daf3_preds = []
-    for d_img in daf3_digits:
-        feat = extract_hog_features(d_img)
-        pred = SVMclassifier.predict([feat])[0]
-        daf3_preds.append(str(pred))
-    daf3_txt = ''.join(daf3_preds)
-    
+    code_txt = ''.join([str(SVMclassifier.predict([extract_hog_features(d)])[0]) for d in code_digits])
+    daf3_txt = ''.join([str(SVMclassifier.predict([extract_hog_features(d)])[0]) for d in daf3_digits])
     name_txt = extractname(name_img, reader)
 
     return {
-        "aligned_image": img,
-        "name_image": name_img,
-        "daf3_image": daf3_full,
-        "code_image": code_full,
-        "digit_imgs": code_digits,
-        "daf3_digit_imgs": daf3_digits,
-        "name_text": name_txt,
-        "code_text": code_txt,
-        "daf3_text": daf3_txt
+        "aligned_image": img, "name_image": name_img, "daf3_image": daf3_full, "code_image": code_full,
+        "digit_imgs": code_digits, "daf3_digit_imgs": daf3_digits,
+        "name_text": name_txt, "code_text": code_txt, "daf3_text": daf3_txt
     }
 
-# --- MAIN PIPELINE (UPDATED FOR BATCH) ---
-
 def main_pipeline():
-    # Use GLOBAL ROBUST PATHS
-    path_to_dataset = PATH_TO_RAW_IDS
-    refrence_image_path = REF_IMG_PATH
-
-    # Initialize Reader once here (Using GPU=True as per your snippet)
     print("Initializing EasyOCR (GPU=True)...")
     reader = easyocr.Reader(['ar', 'en'], gpu=True)
-
-    # Ensure the classifier is trained
-    SVMclassifier = train_SVM_robust()
-    if SVMclassifier is None: 
-        print("Classifier could not be trained. Aborting.")
-        return
-
-    data_for_excel = []
-
-    if not os.path.exists(path_to_dataset):
-        print(f"Directory not found: {path_to_dataset}")
-        return
-
-    print("Starting Batch Processing...")
+    svm = train_SVM_robust()
+    if not svm or not os.path.exists(PATH_TO_RAW_IDS): return
     
-    for i in os.listdir(path_to_dataset):
-        if not i.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-            continue
+    data = []
+    for fn in os.listdir(PATH_TO_RAW_IDS):
+        path = os.path.join(PATH_TO_RAW_IDS, fn)
+        if not os.path.isfile(path): continue
+        if not fn.lower().endswith(('.jpg', '.png', '.jpeg')): continue
         
-        img_path = os.path.join(path_to_dataset, i)
-        raw_img = cv2.imread(img_path)
-        clean_img, is_impulsive = is_impulsive_noise(raw_img)
-        aligned_img = align_images_sift(clean_img, refrence_image_path)
-        clean_img2, is_random = is_random_noise(aligned_img)
-        enhanced_img = enhance_contrast_clahe(clean_img2)
+        # Load Raw
+        raw = cv2.imread(path)
+        res = process_single_id(raw, svm, reader, REF_IMG_PATH)
         
-        # NOTE: Unpack 5 values (Backend compatible), use _ to ignore extra dashboard images
-        name_img, digit_imgs, daf3_digits, _, _ = extract_name_and_digits(enhanced_img)
+        # Save Crops (Needed for main_pipeline behavior)
+        sid = os.path.splitext(fn)[0]
+        save_student_name(sid, res['name_image'])
+        save_split_digits(sid, res['digit_imgs'])
+        save_split_digits(f"{sid}_daf3", res['daf3_digit_imgs'], "extracted_daf3_digits")
         
-        student_id = os.path.splitext(i)[0]
-
-        # Use updated save functions (saves relative to backend.py)
-        save_student_name(student_id, name_img)
-        save_split_digits(student_id, digit_imgs)
-        save_split_digits(f"{student_id}_daf3", daf3_digits, output_folder="extracted_daf3_digits")
-
-        digit_preds = []
-        for digit_img in digit_imgs:
-            feat = extract_hog_features(digit_img)
-            pred = SVMclassifier.predict([feat])[0]
-            digit_preds.append(str(pred))
-        code_str = ''.join(digit_preds)
-
-        daf3_preds = []
-        for d_img in daf3_digits:
-            feat = extract_hog_features(d_img)
-            pred = SVMclassifier.predict([feat])[0]
-            daf3_preds.append(str(pred))
-        daf3_str = ''.join(daf3_preds)
-
-        # Extract Name - Pointing to the file we just saved
-        saved_name_path = os.path.join(BACKEND_DIR, 'extracted_names', f'{student_id}_name.jpg')
-        name_text = extractname(saved_name_path, reader)
-
-        data_for_excel.append({
-            "Student ID": student_id,   
-            "Name": name_text,
-            "Code": code_str,
-            "Daf3": daf3_str,
-        })
-        print(f"Processed {student_id}")
-
-    if data_for_excel:
-        df = pd.DataFrame(data_for_excel)
-        print("Processing Complete. Results:")
-        print(df[['Student ID', 'Name', 'Code', 'Daf3']])
-
-        output_file = os.path.join(BACKEND_DIR, "Extracted_Results.xlsx")
-        df.to_excel(output_file, index=False)
-        print(f"Excel file saved to: {output_file}")
+        data.append({"Student ID": sid, "Name": res['name_text'], "Code": res['code_text'], "Daf3": res['daf3_text']})
+        print(f"Processed {sid}")
         
-        true_results_path = os.path.join(BACKEND_DIR, 'True_Results.xlsx')
-        if os.path.exists(true_results_path):
-            acc_report = calculate_pipeline_accuracy(true_results_path, output_file)
-            print(acc_report)
-        else:
-            print(f"Skipping accuracy check: '{true_results_path}' not found.")
+    df = pd.DataFrame(data)
+    out_path = os.path.join(BACKEND_DIR, "Extracted_Results.xlsx")
+    df.to_excel(out_path, index=False)
+    print(f"Batch processing done. Saved to {out_path}")
+    
+    # Run Accuracy
+    true_path = os.path.join(BACKEND_DIR, "True_Results.xlsx")
+    if os.path.exists(true_path):
+        print(calculate_pipeline_accuracy(true_path, out_path))
 
 if __name__ == "__main__":
     main_pipeline()
