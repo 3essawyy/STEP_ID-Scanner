@@ -1,2 +1,15 @@
 .venv
 .vscode
+__pycache__/
+*.pyc
+extracted_names/
+extracted_digits/
+extracted_daf3_digits/
+
+# Generated pipeline outputs (do not version)
+Extracted_Results.xlsx
+
+# Some runs create these at repo root
+extracted_digit_*.jpg
+extract*_name.jpg
+
