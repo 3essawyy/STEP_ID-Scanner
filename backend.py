@@ -419,8 +419,12 @@ def calculate_pipeline_accuracy(true_file_path, extracted_file_path):
 
     row_accuracy = (perfect_rows / min_len) * 100 if min_len > 0 else 0.0
 
-    # Build report string
+    # Build report string with all details
     report_lines = []
+    report_lines.append(f"--- Accuracy Report (Checking {min_len} rows) ---\n")
+    report_lines.append(f"Code Accuracy: {scores.get('Code', 0.0):.2f}%")
+    report_lines.append(f"Daf3 Accuracy: {scores.get('Daf3', 0.0):.2f}%")
+    report_lines.append(f"Name Accuracy: {scores.get('Name', 0.0):.2f}%")
     report_lines.append("\n--------------------------------")
     report_lines.append(f"AVERAGE ACCURACY: {average_accuracy:.2f}%")
     report_lines.append(f"ROW ACCURACY: {row_accuracy:.2f}%")
